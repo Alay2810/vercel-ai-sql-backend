@@ -10,7 +10,14 @@ const XLSX = require("xlsx");
 const path = require("path");
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:3000',
+    'https://ai-sql-agent-frontend.vercel.app',
+    'https://ai-sql-agent-frontend-f8ks2e7j4-alay2810s-projects.vercel.app'
+  ],
+  credentials: true
+}));
 app.use(express.json());
 
 // Configure multer
