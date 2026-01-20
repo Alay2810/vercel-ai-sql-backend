@@ -20,6 +20,23 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    message: 'AI SQL Backend is running',
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    database: db ? 'connected' : 'disconnected',
+    groq: process.env.GROQ_API_KEY ? 'configured' : 'missing'
+  });
+});
+
 // Configure multer
 const upload = multer({ dest: "uploads/" });
 
