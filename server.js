@@ -1,4 +1,4 @@
-require("dotenv").config({ path: "../.env" });
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const Groq = require("groq-sdk");
@@ -632,3 +632,6 @@ app.listen(5000, "0.0.0.0", () => {
   console.log("  POST /export              - Export (legacy)");
   console.log("=================================");
 });
+
+// Export for Vercel serverless
+module.exports = app;
