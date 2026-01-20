@@ -1,0 +1,270 @@
+require("dotenv").config({ path: "../.env" });
+const express = require("express");
+const cors = require("cors");
+const Groq = require("groq-sdk");
+const db = require("./db");
+const multer = require("multer");
+const csv = require("csv-parser");
+const fs = require("fs");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Configure multer for file uploads
+const upload = multer({ dest: "uploads/" });
+
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY
+});
+
+// get table schema
+function getSchema(tableName) {
+  return new Promise((resolve, reject) => {
+    const query = `
+      SELECT COLUMN_NAME, DATA_TYPE
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_NAME = ?
+    `;
+    db.query(query, [tableName], (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
+
+// format schema
+function formatSchema(schema, tableName) {
+  return `${tableName}(` +
+    schema.map(col => `${col.COLUMN_NAME} ${col.DATA_TYPE}`).join(", ")
+    + `)`;
+}
+
+// CSV Upload → Create Table Endpoint
+app.post("/upload", upload.single("file"), async (req, res) => {
+  const tableName = req.body.tableName;
+  const filePath = req.file?.path;
+
+  console.log("📤 Upload request:", { tableName, filePath });
+
+  if (!tableName) {
+    return res.status(400).json({ error: "Table name required" });
+  }
+
+  if (!filePath) {
+    return res.status(400).json({ error: "CSV file required" });
+  }
+
+  // Validate table name (alphanumeric and underscore only)
+  if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
+    return res.status(400).json({ error: "Invalid table name. Use only letters, numbers, and underscores." });
+  }
+
+  try {
+    const rows = [];
+
+    // Parse CSV file
+    fs.createReadStream(filePath)
+      .pipe(csv())
+      .on("data", (data) => rows.push(data))
+      .on("end", () => {
+        if (rows.length === 0) {
+          fs.unlinkSync(filePath);
+          return res.status(400).json({ error: "CSV file is empty" });
+        }
+
+        const columns = Object.keys(rows[0]);
+
+        // Drop table if exists
+        const dropTableSQL = `DROP TABLE IF EXISTS ${tableName}`;
+        
+        db.query(dropTableSQL, (err) => {
+          if (err) {
+            fs.unlinkSync(filePath);
+            return res.status(400).json({ error: err.message });
+          }
+
+          // Create table with auto-detected columns
+          const createTableSQL = `
+            CREATE TABLE ${tableName} (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              ${columns.map(col => `\`${col}\` VARCHAR(255)`).join(",")}
+            )
+          `;
+
+          console.log("🔨 Creating table:", createTableSQL);
+
+          db.query(createTableSQL, (err) => {
+            if (err) {
+              fs.unlinkSync(filePath);
+              return res.status(400).json({ error: err.message });
+            }
+
+            // Insert data rows
+            let insertedCount = 0;
+            rows.forEach((row, index) => {
+              const values = columns.map(col => db.escape(row[col])).join(",");
+              const insertSQL = `
+                INSERT INTO ${tableName} (${columns.map(c => `\`${c}\``).join(",")})
+                VALUES (${values})
+              `;
+
+              db.query(insertSQL, (err) => {
+                if (err) {
+                  console.error(`Error inserting row ${index}:`, err.message);
+                }
+                insertedCount++;
+
+                // Send response after all rows processed
+                if (insertedCount === rows.length) {
+                  fs.unlinkSync(filePath);
+                  console.log(`✅ Table '${tableName}' created with ${rows.length} rows`);
+                  res.json({ 
+                    message: `Table '${tableName}' created successfully with ${rows.length} rows`,
+                    tableName,
+                    rowCount: rows.length,
+                    columns
+                  });
+                }
+              });
+            });
+          });
+        });
+      })
+      .on("error", (err) => {
+        fs.unlinkSync(filePath);
+        res.status(400).json({ error: "Failed to parse CSV: " + err.message });
+      });
+  } catch (err) {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/ask", async (req, res) => {
+  const { table, question } = req.body;
+
+  console.log("📨 Received request:", { table, question });
+
+  if (!table || !question) {
+    return res.status(400).json({ error: "Table and question required" });
+  }
+
+  try {
+    // 1. read schema
+    console.log("🔍 Fetching schema for table:", table);
+    const schemaRows = await getSchema(table);
+    
+    if (!schemaRows || schemaRows.length === 0) {
+      return res.status(404).json({ error: `Table '${table}' not found in database` });
+    }
+    
+    const schemaText = formatSchema(schemaRows, table);
+    console.log("📋 Schema:", schemaText);
+
+    // 2. prompt
+    const prompt = `
+Rules:
+- Use ONLY the schema below
+- Generate ONLY SELECT queries
+- Do NOT hallucinate columns
+- Add LIMIT 100 if missing
+
+Schema:
+${schemaText}
+
+Question:
+${question}
+
+Output format:
+SQL_QUERY:
+<sql>
+
+BUSINESS_EXPLANATION:
+<explanation>
+`;
+
+    // 3. call Groq
+    console.log("🤖 Calling Groq AI...");
+    const response = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [
+        { role: "system", content: "You are an AI SQL Business Analyst." },
+        { role: "user", content: prompt }
+      ],
+      temperature: 0
+    });
+
+    console.log("✅ Groq response received");
+    const content = response.choices[0].message.content;
+    console.log("📝 AI Response:", content);
+
+    // Extract SQL (handle markdown)
+    let sql = content
+      .split("SQL_QUERY:")[1]
+      ?.split("BUSINESS_EXPLANATION:")[0]
+      ?.trim() || "";
+
+    // Remove markdown code blocks if present
+    sql = sql.replace(/```sql\n?/g, "").replace(/```\n?/g, "").trim();
+
+    // Extract explanation
+    let explanation = content
+      .split("BUSINESS_EXPLANATION:")[1]
+      ?.trim() || "No explanation provided";
+
+    // 4. safety
+    if (!sql.toLowerCase().startsWith("select")) {
+      console.log("⚠️ Non-SELECT query blocked:", sql);
+      return res.status(403).json({ error: "Only SELECT allowed" });
+    }
+
+    console.log("🔍 Executing SQL:", sql);
+
+    // 5. execute SQL
+    db.query(sql, (err, results) => {
+      if (err) {
+        console.error("❌ SQL Error:", err.message);
+        return res.status(400).json({ error: err.message });
+      }
+
+      console.log("✅ Query successful, returned", results.length, "rows");
+      res.json({
+        sql,
+        results,
+        explanation
+      });
+    });
+
+  } catch (err) {
+    console.error("❌ Server Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", message: "Backend is running", timestamp: new Date() });
+});
+
+// Root endpoint
+app.get("/", (req, res) => {
+  res.json({ 
+    message: "AI SQL Agent API",
+    endpoints: {
+      "POST /upload": "Upload CSV file to create table",
+      "POST /ask": "Ask question in natural language",
+      "GET /health": "Health check"
+    }
+  });
+});
+
+app.listen(5000, "0.0.0.0", () => {
+  console.log("Backend running on http://localhost:5000");
+  console.log("Endpoints:");
+  console.log("  POST /upload - Upload CSV");
+  console.log("  POST /ask - Ask questions");
+  console.log("  GET /health - Health check");
+});
