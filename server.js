@@ -1,4 +1,5 @@
-require("dotenv").config();
+const path = require("path");
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 const express = require("express");
 const cors = require("cors");
 const Groq = require("groq-sdk");
@@ -7,15 +8,35 @@ const multer = require("multer");
 const csv = require("csv-parser");
 const fs = require("fs");
 const XLSX = require("xlsx");
-const path = require("path");
 
 const app = express();
+const allowedProdOrigins = new Set([
+  'https://ai-sql-agent-frontend.vercel.app',
+  'https://ai-sql-agent-frontend-f8ks2e7j4-alay2810s-projects.vercel.app'
+]);
+
+// Comma-separated list of additional allowed origins (useful for new deployments)
+// Example: ALLOWED_ORIGINS=https://my-frontend.vercel.app,https://mydomain.com
+if (process.env.ALLOWED_ORIGINS) {
+  for (const origin of process.env.ALLOWED_ORIGINS.split(",")) {
+    const trimmed = origin.trim();
+    if (trimmed) allowedProdOrigins.add(trimmed);
+  }
+}
+
+function isAllowedLocalOrigin(origin) {
+  // Allow common local dev servers (VS Code Live Server, Vite, CRA, etc.)
+  // Includes localhost/127.0.0.1 and private LAN IPs (10/172.16-31/192.168).
+  return /^http:\/\/(localhost|127\.0\.0\.1|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(:\d+)?$/.test(origin);
+}
+
 app.use(cors({
-  origin: [
-    'http://localhost:3000',
-    'https://ai-sql-agent-frontend.vercel.app',
-    'https://ai-sql-agent-frontend-f8ks2e7j4-alay2810s-projects.vercel.app'
-  ],
+  origin: (origin, callback) => {
+    // Allow non-browser clients and file:// (Origin: null) usage in local dev.
+    if (!origin || origin === 'null') return callback(null, true);
+    if (allowedProdOrigins.has(origin) || isAllowedLocalOrigin(origin)) return callback(null, true);
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
   credentials: true
 }));
 app.use(express.json());
@@ -40,9 +61,14 @@ app.get('/health', (req, res) => {
 // Configure multer
 const upload = multer({ dest: "uploads/" });
 
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY
-});
+let groq = null;
+if (process.env.GROQ_API_KEY) {
+  groq = new Groq({
+    apiKey: process.env.GROQ_API_KEY
+  });
+} else {
+  console.warn("⚠️ GROQ_API_KEY is missing. /ask endpoint will be unavailable until configured.");
+}
 
 // Get table schema
 function getSchema(tableName) {
@@ -279,6 +305,12 @@ app.post("/ask", async (req, res) => {
 
   if (tableList.length === 0 || !question) {
     return res.status(400).json({ error: "At least one table and question required" });
+  }
+
+  if (!groq) {
+    return res.status(503).json({
+      error: "GROQ_API_KEY is not configured on the backend. Set GROQ_API_KEY in your .env to enable AI querying."
+    });
   }
 
   try {
@@ -638,24 +670,27 @@ app.get("/health", (req, res) => {
 });
 
 // Start server
-app.listen(5000, "0.0.0.0", () => {
-  console.log("=================================");
-  console.log("🚀 AI SQL Workspace Backend");
-  console.log("=================================");
-  console.log("Server: http://localhost:5000");
-  console.log("\nEndpoints:");
-  console.log("  GET  /tables              - List all tables");
-  console.log("  GET  /table/:name/preview - Preview table (10 rows)");
-  console.log("  GET  /table/:name/full    - Full table with pagination");
-  console.log("  GET  /table/:name/count   - Get row count");
-  console.log("  POST /upload              - Upload CSV/Excel/JSON");
-  console.log("  POST /ask                 - Multi-table AI query");
-  console.log("  POST /download            - Download CSV/Excel");
-  console.log("  POST /crud                - CRUD operations");
-  console.log("  POST /execute             - Execute raw SQL");
-  console.log("  POST /export              - Export (legacy)");
-  console.log("=================================");
-});
+if (!process.env.VERCEL) {
+  const port = Number(process.env.PORT) || 5000;
+  app.listen(port, "0.0.0.0", () => {
+    console.log("=================================");
+    console.log("🚀 AI SQL Workspace Backend");
+    console.log("=================================");
+    console.log(`Server: http://localhost:${port}`);
+    console.log("\nEndpoints:");
+    console.log("  GET  /tables              - List all tables");
+    console.log("  GET  /table/:name/preview - Preview table (10 rows)");
+    console.log("  GET  /table/:name/full    - Full table with pagination");
+    console.log("  GET  /table/:name/count   - Get row count");
+    console.log("  POST /upload              - Upload CSV/Excel/JSON");
+    console.log("  POST /ask                 - Multi-table AI query");
+    console.log("  POST /download            - Download CSV/Excel");
+    console.log("  POST /crud                - CRUD operations");
+    console.log("  POST /execute             - Execute raw SQL");
+    console.log("  POST /export              - Export (legacy)");
+    console.log("=================================");
+  });
+}
 
 // Export for Vercel serverless
 module.exports = app;
